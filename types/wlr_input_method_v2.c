@@ -141,17 +141,117 @@ static void keyboard_grab_release(struct wl_client *client,
 	wl_resource_destroy(resource);
 }
 
+struct grab_state {
+	uint32_t state;
+	struct wl_array ranges;
+	struct wl_array singles;
+	struct wl_list link;
+};
+
+static void keyboard_configure_grab(struct wl_client *client,
+			       struct wl_resource *resource,
+			       uint32_t state,
+			       struct wl_array *ranges,
+			       struct wl_array *singles) {
+	struct wlr_input_method_keyboard_grab_v2 *keyboard_grab =
+		keyboard_grab_from_resource(resource);
+	struct grab_state *grab_state = malloc(sizeof(*grab_state));
+	grab_state->state = state;
+	wl_array_init(&grab_state->ranges);
+	wl_array_copy(&grab_state->ranges, ranges);
+	wl_array_init(&grab_state->singles);
+	wl_array_copy(&grab_state->singles, singles);
+//	grab_state->ranges = ranges; // maybe copy here
+//	grab_state->singles = singles;
+	wl_list_insert(&keyboard_grab->grab_states, &grab_state->link);
+}
+
+struct grab_transition {
+	uint32_t state_i;
+	uint32_t state_f;
+	struct wl_array singles;
+	struct wl_list link;
+};
+
+static void keyboard_configure_transitions(struct wl_client *client,
+				      struct wl_resource *resource,
+				      uint32_t state_i,
+				      uint32_t state_f,
+				      struct wl_array *singles) {
+	struct wlr_input_method_keyboard_grab_v2 *keyboard_grab =
+		keyboard_grab_from_resource(resource);
+	wlr_log(WLR_ERROR, "xyzzy size %ld", singles->size);
+	struct grab_transition *tr = malloc(sizeof(*tr));
+	tr->state_i = state_i;
+	tr->state_f = state_f;
+//	tr->singles = singles;
+	wl_array_init(&tr->singles);
+	wl_array_copy(&tr->singles, singles);
+	wl_list_insert(&keyboard_grab->grab_transitions, &tr->link);
+}
+
 static const struct zwp_input_method_keyboard_grab_v2_interface keyboard_grab_impl = {
 	.release = keyboard_grab_release,
+	.configure_grab = keyboard_configure_grab,
+	.configure_transitions = keyboard_configure_transitions,
 };
+
+static bool keyboard_grab_match(struct wlr_input_method_keyboard_grab_v2 *keyboard_grab, uint32_t key) {
+	struct grab_state *grab_state;
+	wl_list_for_each(grab_state, &keyboard_grab->grab_states, link) {
+		if (grab_state->state != keyboard_grab->state)
+    			continue;
+		uint32_t *pos;
+		struct wl_array *array = &grab_state->ranges;
+//		wlr_log(WLR_ERROR, "xyzzy size %ld", array->size);
+		for (pos = (array)->data;					
+	     (const char *) pos < ((const char *) (array)->data + (array)->size);
+	     (pos)+=2) {
+//	wlr_log(WLR_ERROR, "xyzzy range from %x to %x", *pos, *(pos+1));
+			if (key >= *pos && key <= *(pos+1))
+    				return true;
+		}
+	}
+	return false;
+}
+
+static void keyboard_grab_transition(struct wlr_input_method_keyboard_grab_v2 *keyboard_grab, uint32_t key) {
+	struct grab_transition *grab_transition;
+	wl_list_for_each(grab_transition, &keyboard_grab->grab_transitions, link) {
+		if (grab_transition->state_i != keyboard_grab->state)
+    			continue;
+		uint32_t *pos;
+		struct wl_array *array = &grab_transition->singles;
+		for (pos = (array)->data;					
+	     (const char *) pos < ((const char *) (array)->data + (array)->size);
+	     (pos)+=2) {
+			if (key >= *pos && key <= *(pos+1))
+    				keyboard_grab->state = grab_transition->state_f;
+		}
+	}
+}
+
+static bool modactive(struct xkb_state *xkb_state) {
+	return xkb_state_mod_names_are_active(xkb_state, XKB_STATE_MODS_EFFECTIVE, XKB_STATE_MATCH_ANY, XKB_MOD_NAME_CTRL, XKB_MOD_NAME_LOGO, XKB_MOD_NAME_CAPS, NULL) > 0;
+}
 
 void wlr_input_method_keyboard_grab_v2_send_key(
 		struct wlr_input_method_keyboard_grab_v2 *keyboard_grab,
 		uint32_t time, uint32_t key, uint32_t state) {
+    		uint32_t keysym = xkb_state_key_get_one_sym(keyboard_grab->keyboard->xkb_state, key+8);
+    		if (!modactive(keyboard_grab->keyboard->xkb_state) && keyboard_grab_match(keyboard_grab, keysym)) {
 	zwp_input_method_keyboard_grab_v2_send_key(
 		keyboard_grab->resource,
 		wlr_seat_client_next_serial(keyboard_grab->input_method->seat_client),
 		time, key, state);
+		wlr_log(WLR_ERROR, "IM key %x", keysym);
+		} else {
+    		// passthrough
+    		wlr_seat_keyboard_send_key(keyboard_grab->input_method->seat_client->seat, time, key, state);
+		wlr_log(WLR_ERROR, "forward key %x", keysym);
+		}
+		if (state == WL_KEYBOARD_KEY_STATE_RELEASED)
+			keyboard_grab_transition(keyboard_grab, keysym);
 }
 
 void wlr_input_method_keyboard_grab_v2_send_modifiers(
@@ -162,6 +262,8 @@ void wlr_input_method_keyboard_grab_v2_send_modifiers(
 		wlr_seat_client_next_serial(keyboard_grab->input_method->seat_client),
 		modifiers->depressed, modifiers->latched,
 		modifiers->locked, modifiers->group);
+
+    		wlr_seat_keyboard_send_modifiers(keyboard_grab->input_method->seat_client->seat, modifiers);
 }
 
 static bool keyboard_grab_send_keymap(
@@ -280,6 +382,8 @@ static void im_grab_keyboard(struct wl_client *client,
 	}
 	struct wlr_input_method_keyboard_grab_v2 *keyboard_grab =
 		calloc(1, sizeof(struct wlr_input_method_keyboard_grab_v2));
+	wl_list_init(&keyboard_grab->grab_states);
+	wl_list_init(&keyboard_grab->grab_transitions);
 	if (!keyboard_grab) {
 		wl_client_post_no_memory(client);
 		return;
@@ -464,7 +568,7 @@ struct wlr_input_method_manager_v2 *wlr_input_method_manager_v2_create(
 	wl_list_init(&im_manager->input_methods);
 
 	im_manager->global = wl_global_create(display,
-		&zwp_input_method_manager_v2_interface, 1, im_manager,
+		&zwp_input_method_manager_v2_interface, 2, im_manager,
 		input_method_manager_bind);
 	if (!im_manager->global) {
 		free(im_manager);

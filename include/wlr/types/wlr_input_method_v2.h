@@ -60,6 +60,10 @@ struct wlr_input_method_keyboard_grab_v2 {
 	struct wlr_input_method_v2 *input_method;
 	struct wlr_keyboard *keyboard;
 
+	uint32_t state;
+	struct wl_list grab_states;
+	struct wl_list grab_transitions;
+
 	struct wl_listener keyboard_keymap;
 	struct wl_listener keyboard_repeat_info;
 	struct wl_listener keyboard_destroy;
